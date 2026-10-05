@@ -1,0 +1,81 @@
+@startuml Sequence_Purchase_Reservation
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+autonumber
+
+title SALESTORM – Purchase / Reservation Sequence ("Buy Now")\nincludes: success · duplicate request · sold out · last-unit race
+
+actor Customer as C
+participant "CDN/WAF" as CDN
+participant "API Gateway" as GW
+participant "Waiting Room" as WR
+participant "Inventory Service\n(ReservationService)" as INV
+database "Redis\n(stock gate)" as R
+database "Inventory DB\n(PostgreSQL)" as DB
+queue "Kafka" as K
+
+C -> CDN : POST /v1/sales/{saleId}/reservations\nAuthorization: Bearer JWT\nIdempotency-Key: k-123
+CDN -> CDN : bot score / WAF rules
+CDN -> GW : forward
+GW -> GW : verify JWT, rate limit (5 req/s/user)
+alt waiting room active
+  GW -> WR : request admission
+  WR --> C : 202 queued (position N)
+  ...client polls; admitted at controlled rate...
+  WR --> GW : signed admission token (TTL 60 s)
+end
+GW -> INV : reserve(saleId, customerId, qty=1, key=k-123)
+
+== Step A – Idempotency check ==
+INV -> R : GET idem:k-123
+alt key already seen (duplicate click / client retry)
+  R --> INV : reservationId R-77
+  INV --> C : 200 OK (same reservation R-77, replayed)
+else new request
+  R --> INV : nil
+
+== Step B – Fast gate (atomic Lua, single-threaded in Redis) ==
+  INV -> R : EVALSHA reserve.lua\n KEYS: stock:{sale}, buyers:{sale}, idem:k-123\n ARGV: customerId, qty=1
+  note right of R
+    if SISMEMBER buyers customer -> return ALREADY_BOUGHT
+    if GET stock < qty          -> return SOLD_OUT
+    DECRBY stock qty
+    SADD buyers customer
+    SET idem:k-123 PENDING EX 900
+    return OK
+  end note
+  alt SOLD_OUT (≈ 9,900 of 10,000 requests)
+    R --> INV : SOLD_OUT
+    INV --> C : 409 Conflict {code: SOLD_OUT}  (< 50 ms)
+  else ALREADY_BOUGHT (per-customer limit)
+    R --> INV : ALREADY_BOUGHT
+    INV --> C : 409 Conflict {code: LIMIT_REACHED}
+  else OK (≤ 100 requests)
+    R --> INV : OK
+
+== Step C – Source of truth (ONE local ACID transaction) ==
+    INV -> DB : BEGIN
+    INV -> DB : UPDATE inventory\n SET available_quantity = available_quantity - 1,\n     reserved_quantity  = reserved_quantity + 1,\n     version = version + 1, updated_at = now()\n WHERE sale_id = :sale AND available_quantity >= 1
+    alt 1 row updated
+      INV -> DB : INSERT inventory_reservation\n (id, sale_id, customer_id, qty, status='RESERVED',\n  idempotency_key='k-123', expires_at = now()+10 min)
+      INV -> DB : INSERT outbox_event (reservation.created)
+      INV -> DB : COMMIT
+      INV -> R : SET idem:k-123 R-77 EX 900
+      INV --> C : 201 Created {reservationId: R-77, expiresAt}
+      DB --> K : outbox relay → reservation.created
+    else 0 rows (DB says no stock) OR unique violation (duplicate key)
+      INV -> DB : ROLLBACK
+      INV -> R : compensate: INCRBY stock 1, SREM buyers customer
+      INV --> C : 409 SOLD_OUT  /  200 existing reservation
+    end
+  end
+end
+
+note over INV, DB
+  **Last-unit race:** two requests reach Inventory at the same time with 1 unit left.
+  Redis executes Lua scripts one at a time → only one sees stock=1; the other sees 0 → SOLD_OUT.
+  Even if Redis were wrong, PostgreSQL row lock + "WHERE available_quantity >= 1"
+  + CHECK (available_quantity >= 0) lets exactly ONE update succeed.
+end note
+@enduml

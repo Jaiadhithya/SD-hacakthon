@@ -1,0 +1,44 @@
+@startuml State_Reservation
+!pragma layout smetana
+skinparam defaultFontName Arial
+skinparam shadowing false
+hide empty description
+
+title SALESTORM – Inventory Unit / Reservation State Diagram
+
+[*] --> AVAILABLE : unit loaded into sale\n(available_quantity++)
+
+AVAILABLE --> RESERVED : Buy Now succeeds\n[Redis gate OK AND DB conditional UPDATE = 1 row]\n/ available--, reserved++, expires_at = now+10m
+
+RESERVED --> PAYMENT_PENDING : checkout started\n[not expired] / order created
+
+PAYMENT_PENDING --> CONFIRMED : payment.succeeded event\n(idempotent by event_id)
+
+CONFIRMED --> SOLD : stock committed\n/ reserved--, sold++
+
+SOLD --> [*]
+
+RESERVED --> TIMEOUT : now > expires_at\n(ExpiryJob / Redis TTL)
+PAYMENT_PENDING --> TIMEOUT : now > expires_at AND\npayment not SUCCEEDED / unknown\n(reconciler checks gateway first)
+PAYMENT_PENDING --> PAYMENT_FAILED : payment.failed event
+RESERVED --> RELEASED : customer cancels
+
+PAYMENT_FAILED --> RELEASED : / reserved--, available++,\nRedis INCR stock, SREM buyer
+TIMEOUT --> RELEASED : / reserved--, available++,\nRedis INCR stock, SREM buyer
+
+RELEASED --> AVAILABLE : unit back in pool\n(next buyer in waiting room can reserve)
+
+note right of AVAILABLE
+  **Invariant (DB CHECK):**
+  available + reserved + sold = total
+  available >= 0, reserved >= 0, sold >= 0
+  => successful reservations can never exceed stock
+end note
+
+note bottom of RELEASED
+  Every transition = one local ACID transaction
+  + AUDIT_LOG row + outbox event.
+  Transitions are guarded: UPDATE ... WHERE status = '<expected>'
+  => concurrent/duplicate events cannot double-release.
+end note
+@enduml

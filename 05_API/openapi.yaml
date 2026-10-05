@@ -1,0 +1,296 @@
+openapi: 3.0.3
+info:
+  title: SALESTORM Flash-Sale API
+  version: 1.0.0
+  description: Core purchase-path APIs (reservation, checkout, payment, orders). See API_Specification.md for full catalogue and events.
+servers:
+  - url: https://api.salestorm.com/v1
+security:
+  - bearerAuth: []
+
+paths:
+  /sales/{saleId}/reservations:
+    post:
+      summary: Reserve a unit of a flash-sale product (Buy Now)
+      operationId: createReservation
+      parameters:
+        - $ref: '#/components/parameters/SaleId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - name: X-Admission-Token
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationRequest' }
+      responses:
+        '201':
+          description: Reserved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '200':
+          description: Idempotent replay of an earlier successful request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '403': { $ref: '#/components/responses/Problem' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '429': { $ref: '#/components/responses/Problem' }
+
+  /reservations/{reservationId}:
+    get:
+      summary: Get reservation status
+      parameters:
+        - name: reservationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Reservation' }
+        '404': { $ref: '#/components/responses/Problem' }
+    delete:
+      summary: Release a reservation
+      parameters:
+        - name: reservationId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '204': { description: Released }
+        '409': { $ref: '#/components/responses/Problem' }
+
+  /checkout:
+    post:
+      summary: Checkout a reservation (creates order and starts payment)
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CheckoutRequest' }
+      responses:
+        '201':
+          description: Order created, payment pending
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CheckoutResponse' }
+        '409': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /payments:
+    post:
+      summary: Initiate payment for an order
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PaymentRequest' }
+      responses:
+        '201':
+          description: Payment created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '200':
+          description: Idempotent replay
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '402': { $ref: '#/components/responses/Problem' }
+        '503': { $ref: '#/components/responses/Problem' }
+
+  /payments/{paymentId}:
+    get:
+      summary: Get payment status
+      parameters:
+        - name: paymentId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+
+  /webhooks/payments/{provider}:
+    post:
+      summary: Payment gateway webhook (HMAC-signed)
+      security: []
+      parameters:
+        - name: provider
+          in: path
+          required: true
+          schema: { type: string, enum: [razorpay, stripe] }
+        - name: X-Signature
+          in: header
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object }
+      responses:
+        '200': { description: Acknowledged (stored durably) }
+        '401': { description: Invalid signature }
+
+  /orders/{orderId}:
+    get:
+      summary: Get order with status history
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Order' }
+        '404': { $ref: '#/components/responses/Problem' }
+
+  /orders/{orderId}/cancel:
+    post:
+      summary: Cancel an order (if state allows)
+      parameters:
+        - name: orderId
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202': { description: Cancellation accepted (refund/release async) }
+        '409': { $ref: '#/components/responses/Problem' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    SaleId:
+      name: saleId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Client-generated UUID; repeated requests with the same key return the original result.
+      schema: { type: string, maxLength: 64 }
+
+  responses:
+    Problem:
+      description: Error (RFC 7807)
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+
+  schemas:
+    ReservationRequest:
+      type: object
+      required: [productId, quantity]
+      properties:
+        productId: { type: string, format: uuid }
+        quantity: { type: integer, minimum: 1, maximum: 1 }
+
+    Reservation:
+      type: object
+      properties:
+        reservationId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [RESERVED, PAYMENT_PENDING, CONFIRMED, SOLD, PAYMENT_FAILED, TIMEOUT, RELEASED]
+        quantity: { type: integer }
+        expiresAt: { type: string, format: date-time }
+
+    CheckoutRequest:
+      type: object
+      required: [reservationId, shippingAddressId, paymentMethod]
+      properties:
+        reservationId: { type: string, format: uuid }
+        couponCode: { type: string }
+        shippingAddressId: { type: string }
+        paymentMethod:
+          type: object
+          properties:
+            type: { type: string, enum: [CARD, UPI, WALLET] }
+
+    CheckoutResponse:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        orderStatus: { type: string }
+        amount: { $ref: '#/components/schemas/Money' }
+        payment: { $ref: '#/components/schemas/Payment' }
+
+    PaymentRequest:
+      type: object
+      required: [orderId, amount, method]
+      properties:
+        orderId: { type: string, format: uuid }
+        amount: { $ref: '#/components/schemas/Money' }
+        method: { type: string, enum: [CARD, UPI, WALLET] }
+
+    Payment:
+      type: object
+      properties:
+        paymentId: { type: string, format: uuid }
+        status: { type: string, enum: [INITIATED, PENDING, SUCCEEDED, FAILED, TIMED_OUT, REFUNDED] }
+        nextAction:
+          type: object
+          properties:
+            type: { type: string, enum: [REDIRECT, NONE] }
+            url: { type: string, format: uri }
+
+    Order:
+      type: object
+      properties:
+        orderId: { type: string, format: uuid }
+        status:
+          type: string
+          enum: [CREATED, PAYMENT_PENDING, CONFIRMED, PROCESSING, SHIPPED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED]
+        total: { $ref: '#/components/schemas/Money' }
+        history:
+          type: array
+          items:
+            type: object
+            properties:
+              status: { type: string }
+              at: { type: string, format: date-time }
+
+    Money:
+      type: object
+      properties:
+        value: { type: number }
+        currency: { type: string, example: INR }
+
+    Problem:
+      type: object
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        code:
+          type: string
+          enum: [VALIDATION_ERROR, UNAUTHENTICATED, FORBIDDEN, ADMISSION_REQUIRED, NOT_FOUND, SOLD_OUT, LIMIT_REACHED,
+                 RESERVATION_EXPIRED, INVALID_STATE, PAYMENT_FAILED, IDEMPOTENCY_KEY_REUSED, RATE_LIMITED,
+                 PAYMENT_UNAVAILABLE, SERVICE_UNAVAILABLE]
+        detail: { type: string }
+        traceId: { type: string }

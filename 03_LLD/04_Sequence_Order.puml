@@ -1,0 +1,64 @@
+@startuml Sequence_Order
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+autonumber
+
+title SALESTORM – Order Confirmation & Recovery Sequence\n"Payment succeeds, then Order Service is unavailable for 30 seconds"
+
+participant "Payment Svc" as PAY
+database "Payment DB\nOUTBOX" as PDB
+participant "Outbox Relay\n(CDC / poller)" as REL
+queue "Kafka\npayment.events\n(partition key = orderId)" as K
+participant "Order Svc\n(PaymentEventConsumer)" as ORD
+database "Order DB\n(+ processed_events, outbox)" as ODB
+participant "Inventory Svc" as INV
+queue "DLQ\npayment.events.dlq" as DLQ
+participant "Order Reconciler\n(every 1 min)" as REC
+participant "Fulfilment Svc" as FUL
+participant "Notification Svc" as NOT
+
+PAY -> PDB : COMMIT { payment P-1 = SUCCEEDED + outbox row payment.succeeded(event_id E-1) }
+note right : Atomic: the business state and the event\nare written in ONE local transaction\n→ no "paid but event lost"
+REL -> PDB : read unpublished outbox rows
+REL -> K : publish E-1 (acks=all, RF=3)
+REL -> PDB : mark published_at
+
+par Inventory consumer
+  K -> INV : E-1
+  INV -> INV : reservation R-77: PAYMENT_PENDING → CONFIRMED → SOLD\ninventory: reserved -1, sold +1 (one txn, idempotent by event_id)
+  INV -> K : commit offset
+end
+
+== Order Service DOWN for 30 s ==
+K -[#red]x ORD : E-1 delivery fails (pods unavailable / crash-looping)
+note over K : Event is **durable** in Kafka.\nConsumer offset NOT committed → nothing lost.\nCustomer already sees "Payment received, confirming order…"
+
+... 30 seconds later: Order pods healthy again (K8s restarts / rolling recovery) ...
+
+K -> ORD : redeliver E-1 (from last committed offset)
+ORD -> ODB : BEGIN
+ORD -> ODB : INSERT processed_events(E-1)\n(PK conflict => already handled => skip — idempotent)
+ORD -> ODB : UPDATE order O-55 SET status='CONFIRMED', version=version+1\n WHERE id='O-55' AND status='PAYMENT_PENDING'
+ORD -> ODB : INSERT outbox(order.confirmed)
+ORD -> ODB : COMMIT
+ORD -> K : commit offset
+ODB --> K : order.confirmed (via relay)
+K -> FUL : order.confirmed → O-55: CONFIRMED → PROCESSING, book courier
+K -> NOT : order.confirmed → email + SMS "Order confirmed"
+
+== If processing keeps failing (poison message / bug) ==
+ORD -> ORD : retry 5× with exponential backoff (1s,2s,4s,8s,16s)
+ORD -> DLQ : move E-1 to DLQ + alert on-call
+note right of DLQ : Ops fix → replay from DLQ.\nIdempotency makes replay safe.
+
+== Safety net: reconciliation ==
+REC -> PDB : payments SUCCEEDED older than 2 min
+REC -> ODB : … whose order is not CONFIRMED (or later)
+alt order exists in PAYMENT_PENDING
+  REC -> ORD : re-drive confirm(O-55) (idempotent)
+else order cannot be confirmed (e.g. CANCELLED after reservation expiry)
+  REC -> PAY : **compensate**: refund(G-888) → payment REFUNDED
+  REC -> NOT : notify customer "refund initiated"
+end
+@enduml

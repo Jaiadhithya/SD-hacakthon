@@ -1,0 +1,121 @@
+@startuml Component_Diagram
+!pragma layout smetana
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam componentStyle rectangle
+skinparam ArrowColor #444444
+
+title SALESTORM – Component Diagram (critical services: Inventory, Checkout, Payment, Order)
+
+package "Inventory & Reservation Service" #FFFDE7 {
+  [ReservationController\n(REST: /reservations)] as IC
+  [IdempotencyFilter] as IIF
+  [ReservationService\n(use-case logic)] as IS
+  [RedisStockGate\n(Lua: check + DECR + dedupe)] as GATE
+  [InventoryRepository] as IREPO
+  [ReservationRepository] as RREPO
+  [ReservationExpiryJob\n(leader-elected sweeper)] as EXP
+  [PaymentEventConsumer\n(confirm / release)] as IPC
+  [OutboxPublisher] as IOUT
+  [StockReconciler\n(Redis vs DB check)] as SREC
+}
+
+package "Checkout Service" #E8F5E9 {
+  [CheckoutController] as CC
+  [CheckoutFacade\n(saga orchestrator)] as CF
+  [PricingEngine\n(Strategy)] as PRICE
+  [InventoryClient] as CIC
+  [OrderClient] as COC
+  [PaymentClient] as CPC
+}
+
+package "Payment Service" #E3F2FD {
+  [PaymentController\n(/payments, /webhooks)] as PC
+  [IdempotencyFilter ] as PIF
+  [PaymentService] as PS
+  [PaymentGatewayFactory] as PGF
+  [CircuitBreaker + Retry\n(Resilience4j)] as CB
+  [RazorpayAdapter] as RZP
+  [StripeAdapter] as STR
+  [WebhookVerifier\n(HMAC signature)] as WV
+  [PaymentReconciler\n(polls PENDING / TIMED_OUT)] as PREC
+  [PaymentRepository] as PREPO
+  [OutboxPublisher ] as POUT
+}
+
+package "Order Service" #F3E5F5 {
+  [OrderController\n(/orders)] as OC
+  [OrderService] as OS
+  [OrderStateMachine\n(State pattern)] as OSM
+  [PaymentEventConsumer ] as OPC
+  [ProcessedEventStore\n(dedupe by event_id)] as PES
+  [OrderRepository] as OREPO
+  [OutboxPublisher  ] as OOUT
+  [OrderReconciler\n(paid but no CONFIRMED order)] as OREC
+}
+
+database "Redis" as REDIS
+database "Inventory DB" as IDB
+database "Payment DB" as PDB
+database "Order DB" as ODB
+queue "Kafka" as K
+cloud "Payment Gateway" as PG
+
+IC --> IIF
+IIF --> IS
+IS --> GATE
+GATE --> REDIS
+IS --> IREPO
+IS --> RREPO
+IREPO --> IDB
+RREPO --> IDB
+IS --> IOUT
+IOUT --> IDB : outbox row (same txn)
+EXP --> IS : release expired
+IPC --> IS : confirm / release
+SREC --> REDIS
+SREC --> IDB
+
+CC --> CF
+CF --> CIC
+CF --> PRICE
+CF --> COC
+CF --> CPC
+CIC --> IC : validate hold
+COC --> OC : create order
+CPC --> PC : initiate payment
+
+PC --> PIF
+PIF --> PS
+PC --> WV
+WV --> PS
+PS --> PGF
+PGF --> RZP
+PGF --> STR
+PS --> CB
+CB --> RZP
+CB --> STR
+RZP --> PG
+STR --> PG
+PS --> PREPO
+PREPO --> PDB
+PS --> POUT
+POUT --> PDB
+PREC --> PS
+
+OC --> OS
+OPC --> PES
+OPC --> OS
+OS --> OSM
+OS --> OREPO
+OREPO --> ODB
+OS --> OOUT
+OOUT --> ODB
+OREC --> OS
+
+IDB ..> K : outbox relay (CDC / poller)
+PDB ..> K
+ODB ..> K
+K ..> IPC : payment.succeeded / payment.failed
+K ..> OPC : payment.succeeded / payment.failed
+@enduml

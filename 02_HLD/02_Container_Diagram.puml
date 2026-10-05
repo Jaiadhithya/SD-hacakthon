@@ -1,0 +1,75 @@
+@startuml Container_Diagram
+!include <C4/C4_Container>
+!pragma layout smetana
+LAYOUT_TOP_DOWN()
+LAYOUT_WITH_LEGEND()
+
+title SALESTORM – Container / Service Architecture\n(solid = synchronous REST/gRPC · dashed "async" = Kafka events)
+
+Person(customer, "Customer")
+System_Ext(pg, "Payment Gateway")
+System_Ext(courier, "Delivery Partner")
+System_Ext(msg, "Email / SMS / Push")
+
+System_Boundary(edge, "Edge") {
+  Container(cdn, "CDN + WAF", "CloudFront / Cloudflare", "Static assets, cached product pages, bot & DDoS filtering")
+  Container(lb, "Load Balancer", "L7 ALB", "TLS termination, health checks, spreads load across gateway pods")
+  Container(gw, "API Gateway", "Kong / Envoy", "JWT auth, per-user & per-IP rate limiting, routing, request-ID")
+  Container(wr, "Waiting Room", "Go service + Redis", "Admission control: issues signed admission tokens at a fixed rate")
+}
+
+System_Boundary(core, "SALESTORM Services (Kubernetes, stateless, horizontally scaled)") {
+  Container(product, "Product / Catalog Service", "Java Spring Boot", "Products, categories, search; read-heavy")
+  Container(sale, "Sale / Promotion Service", "Java Spring Boot", "Sale window, sale price, coupons, per-customer limits")
+  Container(cart, "Cart Service", "Java Spring Boot", "Cart & cart items")
+  Container(inv, "Inventory & Reservation Service", "Java Spring Boot", "**Single point of contention control**: atomic reserve / confirm / release, expiry sweeper")
+  Container(checkout, "Checkout Service (Facade / Saga orchestrator)", "Java Spring Boot", "Validates reservation, prices order, creates order, starts payment")
+  Container(pay, "Payment Service", "Java Spring Boot", "Idempotent payments, gateway adapters, circuit breaker, reconciliation")
+  Container(order, "Order Service", "Java Spring Boot", "Order lifecycle state machine")
+  Container(ful, "Fulfilment & Shipment Service", "Java Spring Boot", "Pick/pack, courier booking, tracking")
+  Container(notif, "Notification Service", "Node.js", "Templates, channel routing, retries")
+}
+
+System_Boundary(data, "Data & Messaging") {
+  ContainerDb(redis, "Redis Cluster", "Redis 7", "Stock counters (Lua atomic), idempotency cache, rate-limit buckets, cart, sessions")
+  ContainerDb(invdb, "Inventory DB", "PostgreSQL (primary + sync replica)", "INVENTORY, INVENTORY_RESERVATION – source of truth")
+  ContainerDb(orddb, "Order DB", "PostgreSQL", "ORDER, ORDER_ITEM, OUTBOX")
+  ContainerDb(paydb, "Payment DB", "PostgreSQL", "PAYMENT, PAYMENT_ATTEMPT, OUTBOX")
+  ContainerDb(catdb, "Catalog DB + Search", "PostgreSQL + OpenSearch", "PRODUCT, CATEGORY, SALE, COUPON")
+  ContainerQueue(kafka, "Event Bus", "Apache Kafka (RF=3)", "reservation.*, payment.*, order.*, shipment.* topics + DLQs")
+}
+
+Rel(customer, cdn, "HTTPS")
+Rel(cdn, lb, "Dynamic requests")
+Rel(lb, gw, "Routes")
+Rel(gw, wr, "Buy Now → admission token")
+Rel(gw, product, "Browse / search")
+Rel(gw, cart, "Cart ops")
+Rel(gw, inv, "POST /reservations (with admission token)")
+Rel(gw, checkout, "POST /checkout")
+Rel(gw, order, "GET /orders (tracking)")
+
+Rel(product, catdb, "Read")
+Rel(product, redis, "Cache-aside")
+Rel(sale, catdb, "Read/Write")
+Rel(cart, redis, "Read/Write")
+Rel(inv, redis, "Lua: DECR stock + dedupe (fast gate)")
+Rel(inv, invdb, "Conditional UPDATE + INSERT reservation (one ACID txn)")
+Rel(checkout, inv, "Validate reservation", "sync")
+Rel(checkout, sale, "Price + coupon", "sync")
+Rel(checkout, order, "Create order (PAYMENT_PENDING)", "sync")
+Rel(checkout, pay, "Initiate payment", "sync")
+Rel(pay, pg, "Charge / query / refund", "HTTPS + idempotency key")
+Rel(pay, paydb, "Write")
+Rel(order, orddb, "Write")
+
+Rel(pay, kafka, "payment.succeeded / failed (via outbox)", "async")
+Rel(kafka, order, "consume payment.*", "async")
+Rel(kafka, inv, "consume payment.* → confirm / release", "async")
+Rel(order, kafka, "order.confirmed (via outbox)", "async")
+Rel(kafka, ful, "consume order.confirmed", "async")
+Rel(ful, courier, "Book shipment")
+Rel(ful, kafka, "shipment.*", "async")
+Rel(kafka, notif, "consume all customer-facing events", "async")
+Rel(notif, msg, "Send")
+@enduml

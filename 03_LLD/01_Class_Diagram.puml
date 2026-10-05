@@ -1,0 +1,264 @@
+@startuml Class_Diagram
+!pragma layout smetana
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+skinparam linetype ortho
+
+title SALESTORM – Class Diagram (Inventory, Payment, Order + Checkout facade)
+
+' ============== INVENTORY ==============
+package "inventory" #FFFDE7 {
+  interface ReservationUseCase {
+    + reserve(cmd: ReserveCommand): ReservationResult
+    + confirm(reservationId: UUID): void
+    + release(reservationId: UUID, reason: ReleaseReason): void
+  }
+  class ReservationService {
+    - stockGate: StockGate
+    - inventoryRepo: InventoryRepository
+    - reservationRepo: ReservationRepository
+    - events: DomainEventPublisher
+    - clock: Clock
+    + reserve(cmd): ReservationResult
+    + confirm(id): void
+    + release(id, reason): void
+  }
+  interface StockGate {
+    + tryAcquire(saleId, customerId, qty): GateResult
+    + giveBack(saleId, customerId, qty): void
+  }
+  class RedisLuaStockGate {
+    - redis: RedisClient
+    - reserveScript: LuaScript
+  }
+  interface InventoryRepository {
+    + reserveAtomically(saleId, qty): boolean
+    + confirmSold(saleId, qty): void
+    + releaseReserved(saleId, qty): void
+  }
+  interface ReservationRepository {
+    + findByIdempotencyKey(key): Optional<Reservation>
+    + save(r: Reservation): Reservation
+    + findExpired(now, limit): List<Reservation>
+  }
+  class Reservation {
+    - id: UUID
+    - saleId: UUID
+    - customerId: UUID
+    - quantity: int
+    - status: ReservationStatus
+    - idempotencyKey: String
+    - expiresAt: Instant
+    + markPaymentPending(): void
+    + confirm(): void
+    + release(reason): void
+    + isExpired(now): boolean
+  }
+  enum ReservationStatus {
+    RESERVED
+    PAYMENT_PENDING
+    CONFIRMED
+    SOLD
+    PAYMENT_FAILED
+    TIMEOUT
+    RELEASED
+  }
+  class ReservationExpiryJob {
+    + run(): void
+  }
+}
+
+' ============== PAYMENT ==============
+package "payment" #E3F2FD {
+  interface PaymentUseCase {
+    + initiate(cmd: PayCommand): PaymentResult
+    + handleWebhook(evt: GatewayEvent): void
+    + reconcile(paymentId: UUID): void
+  }
+  class PaymentService {
+    - repo: PaymentRepository
+    - factory: PaymentGatewayFactory
+    - events: DomainEventPublisher
+  }
+  interface PaymentGateway <<Adapter target>> {
+    + charge(req: ChargeRequest): ChargeResponse
+    + queryStatus(merchantRef: String): GatewayStatus
+    + refund(gatewayTxnId: String, amount): RefundResponse
+  }
+  class RazorpayAdapter
+  class StripeAdapter
+  class CircuitBreakerGateway <<Decorator>> {
+    - delegate: PaymentGateway
+    - breaker: CircuitBreaker
+    - timeout: Duration
+  }
+  class PaymentGatewayFactory <<Factory>> {
+    + forProvider(p: Provider): PaymentGateway
+  }
+  interface PaymentRepository {
+    + findByIdempotencyKey(key): Optional<Payment>
+    + save(p: Payment): Payment
+    + findStuck(olderThan): List<Payment>
+  }
+  class Payment {
+    - id: UUID
+    - orderId: UUID
+    - merchantTxnRef: String
+    - gatewayTxnId: String
+    - amount: Money
+    - status: PaymentStatus
+    - idempotencyKey: String
+    + markSucceeded(gwTxnId): void
+    + markFailed(reason): void
+    + markTimedOut(): void
+  }
+  enum PaymentStatus {
+    INITIATED
+    PENDING
+    SUCCEEDED
+    FAILED
+    TIMED_OUT
+    REFUNDED
+  }
+  class PaymentReconciler {
+    + run(): void
+  }
+}
+
+' ============== ORDER ==============
+package "order" #F3E5F5 {
+  interface OrderUseCase {
+    + create(cmd: CreateOrderCommand): Order
+    + onPaymentSucceeded(evt): void
+    + onPaymentFailed(evt): void
+    + cancel(orderId): void
+  }
+  class OrderService {
+    - repo: OrderRepository
+    - processed: ProcessedEventStore
+    - events: DomainEventPublisher
+  }
+  class Order {
+    - id: UUID
+    - customerId: UUID
+    - reservationId: UUID
+    - items: List<OrderItem>
+    - total: Money
+    - state: OrderState
+    - version: long
+    + transitionTo(next: OrderStatus): void
+  }
+  class OrderItem {
+    - productId: UUID
+    - quantity: int
+    - unitPrice: Money
+  }
+  interface OrderState <<State>> {
+    + next(order, target: OrderStatus): OrderState
+    + canCancel(): boolean
+  }
+  class CreatedState
+  class PaymentPendingState
+  class ConfirmedState
+  class ProcessingState
+  class ShippedState
+  class DeliveredState
+  class CancelledState
+  interface OrderRepository {
+    + save(o: Order): Order
+    + findById(id): Optional<Order>
+  }
+  interface OrderEventListener <<Observer>> {
+    + on(evt: OrderEvent): void
+  }
+  class NotificationListener
+  class FulfilmentListener
+  interface ProcessedEventStore {
+    + markIfFirst(eventId: UUID): boolean
+  }
+}
+
+' ============== CHECKOUT & SHARED ==============
+package "checkout" #E8F5E9 {
+  class CheckoutFacade <<Facade>> {
+    - inventory: ReservationUseCase
+    - pricing: PricingStrategy
+    - orders: OrderUseCase
+    - payments: PaymentUseCase
+    + checkout(cmd: CheckoutCommand): CheckoutResult
+  }
+  interface PricingStrategy <<Strategy>> {
+    + price(item, customer, sale): Money
+  }
+  class FlashSalePricing
+  class CouponPricing
+  class RegularPricing
+}
+
+package "shared" #ECEFF1 {
+  interface DomainEventPublisher {
+    + publish(evt: DomainEvent): void
+  }
+  class OutboxEventPublisher {
+    ' writes to OUTBOX_EVENT in the caller's DB transaction
+  }
+  interface DeliveryPartner <<Adapter target>> {
+    + createShipment(order): ShipmentRef
+    + track(awb): TrackingStatus
+  }
+  class DelhiveryAdapter
+  class ShiprocketAdapter
+}
+
+' --- relationships ---
+ReservationUseCase <|.. ReservationService
+StockGate <|.. RedisLuaStockGate
+ReservationService --> StockGate
+ReservationService --> InventoryRepository
+ReservationService --> ReservationRepository
+ReservationService --> DomainEventPublisher
+ReservationRepository ..> Reservation
+Reservation --> ReservationStatus
+ReservationExpiryJob --> ReservationUseCase
+
+PaymentUseCase <|.. PaymentService
+PaymentGateway <|.. RazorpayAdapter
+PaymentGateway <|.. StripeAdapter
+PaymentGateway <|.. CircuitBreakerGateway
+CircuitBreakerGateway o--> PaymentGateway : delegate
+PaymentService --> PaymentGatewayFactory
+PaymentGatewayFactory ..> PaymentGateway : creates
+PaymentService --> PaymentRepository
+PaymentService --> DomainEventPublisher
+Payment --> PaymentStatus
+PaymentReconciler --> PaymentUseCase
+
+OrderUseCase <|.. OrderService
+OrderService --> OrderRepository
+OrderService --> ProcessedEventStore
+OrderService --> DomainEventPublisher
+Order *-- "1..*" OrderItem
+Order --> OrderState
+OrderState <|.. CreatedState
+OrderState <|.. PaymentPendingState
+OrderState <|.. ConfirmedState
+OrderState <|.. ProcessingState
+OrderState <|.. ShippedState
+OrderState <|.. DeliveredState
+OrderState <|.. CancelledState
+OrderEventListener <|.. NotificationListener
+OrderEventListener <|.. FulfilmentListener
+FulfilmentListener --> DeliveryPartner
+DeliveryPartner <|.. DelhiveryAdapter
+DeliveryPartner <|.. ShiprocketAdapter
+
+CheckoutFacade --> ReservationUseCase
+CheckoutFacade --> PricingStrategy
+CheckoutFacade --> OrderUseCase
+CheckoutFacade --> PaymentUseCase
+PricingStrategy <|.. FlashSalePricing
+PricingStrategy <|.. CouponPricing
+PricingStrategy <|.. RegularPricing
+DomainEventPublisher <|.. OutboxEventPublisher
+@enduml

@@ -1,0 +1,84 @@
+@startuml HLD_Architecture
+!pragma layout smetana
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam rectangle {
+  RoundCorner 12
+}
+skinparam ArrowColor #444444
+left to right direction
+
+title SALESTORM – High-Level Architecture (request path for "Buy Now")
+
+actor "10,000 – 500,000\nCustomers" as U
+
+rectangle "EDGE LAYER" #E3F2FD {
+  rectangle "CDN + WAF\n• cache product/sale pages\n• bot score, DDoS shield\n• geo rate limit" as CDN
+  rectangle "L7 Load Balancer\n• TLS termination\n• health checks" as LB
+  rectangle "API Gateway\n• JWT auth\n• token-bucket rate limit\n  (5 req/s per user)\n• Idempotency-Key required" as GW
+  rectangle "Virtual Waiting Room\n• queue position\n• admits N req/s\n• signed admission token" as WR
+}
+
+rectangle "SERVICE LAYER (K8s, stateless, HPA autoscaling)" #E8F5E9 {
+  rectangle "Product /\nCatalog" as P
+  rectangle "Sale /\nPromotion" as S
+  rectangle "Cart" as C
+  rectangle "<b>Inventory &\n<b>Reservation\n(contention point)" as I #FFF59D
+  rectangle "Checkout\n(Facade +\nSaga orchestrator)" as CO
+  rectangle "Payment\n(+ Circuit Breaker)" as PAY
+  rectangle "Order\n(State machine)" as O
+  rectangle "Fulfilment /\nShipment" as F
+  rectangle "Notification" as N
+}
+
+rectangle "DATA LAYER" #FFF3E0 {
+  database "Redis Cluster\nstock:{sku} counter\nLua atomic DECR\nidempotency keys" as R
+  database "PostgreSQL\nInventory DB\n(source of truth)\nCHECK avail >= 0" as IDB
+  database "PostgreSQL\nOrder DB + Outbox" as ODB
+  database "PostgreSQL\nPayment DB + Outbox" as PDB
+  queue "Kafka\npayment.* order.*\nreservation.* shipment.*\n+ DLQ topics" as K
+}
+
+rectangle "EXTERNAL" #FCE4EC {
+  rectangle "Payment Gateway" as PG
+  rectangle "Delivery Partner" as DP
+  rectangle "Email/SMS/Push" as MSG
+}
+
+rectangle "OBSERVABILITY" #ECEFF1 {
+  rectangle "Prometheus + Grafana\nOpenTelemetry tracing\nELK / Loki logs\nPagerDuty alerts" as OBS
+}
+
+U --> CDN : HTTPS
+CDN --> LB : only 1-5% of traffic\n(dynamic only)
+LB --> GW
+GW --> WR : Buy Now
+WR --> I : admitted @ 20k/s
+GW --> P
+GW --> C
+GW --> CO
+P --> R : cache
+I --> R : (1) fast gate\n(99% rejected here)
+I --> IDB : (2) ACID reserve\n(max 100 succeed)
+CO --> I : validate hold
+CO --> S : price
+CO --> O : create order
+CO --> PAY : pay
+PAY --> PG : idempotent charge
+PAY --> PDB
+O --> ODB
+PDB ..> K : outbox relay
+ODB ..> K : outbox relay
+K ..> O : payment.succeeded
+K ..> I : confirm / release
+K ..> F : order.confirmed
+K ..> N : all events
+F --> DP
+N --> MSG
+
+legend right
+  **Solid arrow** = synchronous (REST/gRPC) – user waits
+  **Dotted arrow** = asynchronous (Kafka) – retried, idempotent consumers
+  **Yellow** = the exact point where inventory contention is controlled
+endlegend
+@enduml

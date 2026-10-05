@@ -1,0 +1,48 @@
+@startuml State_Order
+!pragma layout smetana
+skinparam defaultFontName Arial
+skinparam shadowing false
+hide empty description
+
+title SALESTORM – Order Lifecycle State Diagram
+
+[*] --> CREATED : checkout creates order\n(linked to reservation)
+
+CREATED --> PAYMENT_PENDING : payment initiated
+
+PAYMENT_PENDING --> CONFIRMED : payment.succeeded\n(event, idempotent)
+PAYMENT_PENDING --> CANCELLED : payment.failed\nOR reservation expired
+
+CONFIRMED --> PROCESSING : fulfilment accepted\n(pick & pack)
+CONFIRMED --> CANCELLED : customer cancels\n/ refund + release stock
+
+PROCESSING --> SHIPPED : courier picked up\n(AWB assigned)
+PROCESSING --> CANCELLED : out-of-stock at warehouse\n/ refund (compensation)
+
+SHIPPED --> OUT_FOR_DELIVERY : courier webhook
+OUT_FOR_DELIVERY --> DELIVERED : courier webhook\n(proof of delivery)
+OUT_FOR_DELIVERY --> SHIPPED : delivery attempt failed\n(re-attempt)
+
+DELIVERED --> [*]
+CANCELLED --> [*]
+
+note right of PAYMENT_PENDING
+  Recovery: if Order Service is down when
+  payment succeeds, the order stays here
+  until the Kafka event is redelivered or the
+  OrderReconciler re-drives it.
+end note
+
+note left of CANCELLED
+  Cancellation after CONFIRMED triggers
+  compensation: payment refund +
+  reservation release (if not shipped).
+end note
+
+note bottom of DELIVERED
+  Implemented with the **State pattern**: each state class
+  allows only its legal next states; illegal transition =>
+  IllegalStateTransitionException. Persisted with optimistic
+  locking (version column) + guarded UPDATE ... WHERE status = ?
+end note
+@enduml

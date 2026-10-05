@@ -1,0 +1,91 @@
+@startuml Deployment_Diagram
+!pragma layout smetana
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam node {
+  BackgroundColor #FAFAFA
+}
+
+title SALESTORM – Deployment Diagram (single region, 3 Availability Zones; DR region warm standby)
+
+cloud "CDN / WAF\n(global PoPs)" as CDN
+actor Customer
+Customer --> CDN
+
+node "Cloud Region: ap-south-1 (primary)" as REGION {
+
+  node "Public Subnets (AZ-a, AZ-b, AZ-c)" {
+    node "Application Load Balancer\n(multi-AZ)" as ALB
+  }
+
+  node "Kubernetes Cluster (EKS/GKE) – private subnets, 3 AZs" as K8S {
+    node "Namespace: edge" {
+      artifact "api-gateway\n6 → 60 pods (HPA on RPS)" as GW
+      artifact "waiting-room\n3 → 30 pods" as WR
+    }
+    node "Namespace: commerce" {
+      artifact "product-svc  4 → 40 pods" as P
+      artifact "cart-svc  3 → 20 pods" as C
+      artifact "sale-svc  2 → 10 pods" as S
+      artifact "inventory-svc  6 → 30 pods\n(+ expiry-sweeper CronJob, leader-elected)" as I
+      artifact "checkout-svc  3 → 20 pods" as CO
+      artifact "payment-svc  3 → 15 pods\n(+ reconciler job)" as PAY
+      artifact "order-svc  3 → 15 pods\n(+ outbox relay)" as O
+      artifact "fulfilment-svc  2 → 6 pods" as F
+      artifact "notification-svc  2 → 20 pods" as N
+    }
+    node "Namespace: observability" {
+      artifact "OTel Collector · Prometheus · Grafana · Loki" as OBS
+    }
+  }
+
+  node "Managed Data Services (multi-AZ)" {
+    database "Redis Cluster\n3 shards × (1 primary + 1 replica)" as R
+    database "PostgreSQL – Inventory\nprimary (AZ-a) + sync standby (AZ-b)\n+ async read replica (AZ-c)" as IDB
+    database "PostgreSQL – Order" as ODB
+    database "PostgreSQL – Payment" as PDB
+    database "PostgreSQL + OpenSearch – Catalog" as CDB
+    queue "Kafka (MSK)\n3 brokers, 1 per AZ\nRF=3, min.insync=2" as K
+  }
+
+  node "Secrets & Security" {
+    artifact "Secrets Manager / Vault\nKMS keys" as SEC
+  }
+}
+
+node "DR Region (warm standby)" as DR {
+  database "Cross-region async replicas\n(PostgreSQL, Kafka MirrorMaker)" as DRDB
+}
+
+cloud "External" {
+  node "Payment Gateway" as PG
+  node "Delivery Partner" as DP
+  node "Email / SMS / Push" as MSG
+}
+
+CDN --> ALB : HTTPS
+ALB --> GW
+GW --> WR
+GW --> P
+GW --> C
+GW --> I
+GW --> CO
+CO --> S
+CO --> PAY
+CO --> O
+I --> R
+I --> IDB
+PAY --> PDB
+O --> ODB
+P --> CDB
+PAY --> K
+O --> K
+K --> F
+K --> N
+PAY --> PG : NAT egress, mTLS
+F --> DP
+N --> MSG
+IDB ..> DRDB : async replication
+ODB ..> DRDB
+PDB ..> DRDB
+@enduml

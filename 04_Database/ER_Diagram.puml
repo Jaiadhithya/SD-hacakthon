@@ -1,0 +1,207 @@
+@startuml ER_Diagram
+!pragma layout smetana
+skinparam defaultFontName Arial
+skinparam shadowing false
+hide circle
+skinparam linetype ortho
+
+title SALESTORM – ER Diagram (PK = primary key, FK = foreign key, UQ = unique)
+
+entity CUSTOMER {
+  * customer_id : UUID <<PK>>
+  --
+  * email : VARCHAR <<UQ>>
+  * phone : VARCHAR
+  * name : VARCHAR
+  * status : ENUM(ACTIVE, BLOCKED)
+  * created_at : TIMESTAMPTZ
+}
+
+entity CATEGORY {
+  * category_id : UUID <<PK>>
+  --
+  parent_id : UUID <<FK>>
+  * name : VARCHAR
+}
+
+entity PRODUCT {
+  * product_id : UUID <<PK>>
+  --
+  * category_id : UUID <<FK>>
+  * sku : VARCHAR <<UQ>>
+  * name : VARCHAR
+  * base_price : NUMERIC(12,2)
+  * status : ENUM(ACTIVE, INACTIVE)
+}
+
+entity SALE {
+  * sale_id : UUID <<PK>>
+  --
+  * product_id : UUID <<FK>>
+  * sale_price : NUMERIC(12,2)
+  * total_stock : INT  CHECK > 0
+  * per_customer_limit : INT DEFAULT 1
+  * hold_minutes : INT DEFAULT 10
+  * starts_at : TIMESTAMPTZ
+  * ends_at : TIMESTAMPTZ  CHECK ends_at > starts_at
+  * status : ENUM(SCHEDULED, LIVE, SOLD_OUT, ENDED)
+}
+
+entity COUPON {
+  * coupon_id : UUID <<PK>>
+  --
+  sale_id : UUID <<FK>>
+  * code : VARCHAR <<UQ>>
+  * discount_type : ENUM(PERCENT, FLAT)
+  * value : NUMERIC
+  * max_uses : INT
+  * used_count : INT CHECK used_count <= max_uses
+}
+
+entity INVENTORY #FFF59D {
+  * inventory_id : UUID <<PK>>
+  --
+  * product_id : UUID <<FK>>
+  * sale_id : UUID <<FK>>  <<UQ(product_id, sale_id)>>
+  * available_quantity : INT  CHECK >= 0
+  * reserved_quantity : INT  CHECK >= 0
+  * sold_quantity : INT  CHECK >= 0
+  * total_quantity : INT
+  CHECK (available + reserved + sold = total)
+  * version : BIGINT
+  * updated_at : TIMESTAMPTZ
+}
+
+entity INVENTORY_RESERVATION #FFF59D {
+  * reservation_id : UUID <<PK>>
+  --
+  * inventory_id : UUID <<FK>>
+  * customer_id : UUID <<FK>>
+  * sale_id : UUID <<FK>>
+  * quantity : INT CHECK > 0
+  * status : ENUM(RESERVED, PAYMENT_PENDING, CONFIRMED,\n SOLD, PAYMENT_FAILED, TIMEOUT, RELEASED)
+  * idempotency_key : VARCHAR <<UQ>>
+  * expires_at : TIMESTAMPTZ
+  * created_at / updated_at : TIMESTAMPTZ
+  --
+  UQ partial (sale_id, customer_id)
+     WHERE status IN (RESERVED, PAYMENT_PENDING, CONFIRMED, SOLD)
+  IDX (status, expires_at)  -- expiry sweeper
+}
+
+entity CART {
+  * cart_id : UUID <<PK>>
+  --
+  * customer_id : UUID <<FK>> <<UQ>>
+  * updated_at : TIMESTAMPTZ
+}
+
+entity CART_ITEM {
+  * cart_item_id : UUID <<PK>>
+  --
+  * cart_id : UUID <<FK>>
+  * product_id : UUID <<FK>>
+  * quantity : INT CHECK > 0
+  UQ (cart_id, product_id)
+}
+
+entity "ORDER" as ORDERS {
+  * order_id : UUID <<PK>>
+  --
+  * customer_id : UUID <<FK>>
+  * reservation_id : UUID <<FK>> <<UQ>>
+  * status : ENUM(CREATED, PAYMENT_PENDING, CONFIRMED, PROCESSING,\n SHIPPED, OUT_FOR_DELIVERY, DELIVERED, CANCELLED)
+  * total_amount : NUMERIC(12,2)
+  * currency : CHAR(3)
+  * idempotency_key : VARCHAR <<UQ>>
+  * version : BIGINT
+  * created_at / updated_at : TIMESTAMPTZ
+  IDX (customer_id, created_at)
+}
+
+entity ORDER_ITEM {
+  * order_item_id : UUID <<PK>>
+  --
+  * order_id : UUID <<FK>>
+  * product_id : UUID <<FK>>
+  * quantity : INT
+  * unit_price : NUMERIC(12,2)
+}
+
+entity PAYMENT {
+  * payment_id : UUID <<PK>>
+  --
+  * order_id : UUID <<FK>>
+  * idempotency_key : VARCHAR <<UQ>>
+  * merchant_txn_ref : VARCHAR <<UQ>>
+  gateway_txn_id : VARCHAR <<UQ>>
+  * provider : VARCHAR
+  * amount : NUMERIC(12,2)
+  * status : ENUM(INITIATED, PENDING, SUCCEEDED, FAILED,\n TIMED_OUT, REFUNDED)
+  * attempt_count : INT
+  * created_at / updated_at : TIMESTAMPTZ
+  UQ partial (order_id) WHERE status = SUCCEEDED
+}
+
+entity SHIPMENT {
+  * shipment_id : UUID <<PK>>
+  --
+  * order_id : UUID <<FK>> <<UQ>>
+  * carrier : VARCHAR
+  awb_number : VARCHAR <<UQ>>
+  * status : ENUM(PENDING, SHIPPED, OUT_FOR_DELIVERY, DELIVERED)
+  * address_snapshot : JSONB
+}
+
+entity NOTIFICATION {
+  * notification_id : UUID <<PK>>
+  --
+  * customer_id : UUID <<FK>>
+  * event_id : UUID <<UQ>>  -- dedupe
+  * channel : ENUM(EMAIL, SMS, PUSH)
+  * template : VARCHAR
+  * status : ENUM(QUEUED, SENT, FAILED)
+}
+
+entity OUTBOX_EVENT {
+  * event_id : UUID <<PK>>
+  --
+  * aggregate_type : VARCHAR
+  * aggregate_id : UUID
+  * event_type : VARCHAR
+  * payload : JSONB
+  * created_at : TIMESTAMPTZ
+  published_at : TIMESTAMPTZ
+  IDX (published_at) WHERE published_at IS NULL
+}
+
+entity AUDIT_LOG {
+  * audit_id : BIGSERIAL <<PK>>
+  --
+  * entity_type : VARCHAR
+  * entity_id : UUID
+  * from_state / to_state : VARCHAR
+  * actor : VARCHAR
+  * trace_id : VARCHAR
+  * at : TIMESTAMPTZ
+}
+
+CATEGORY ||--o{ CATEGORY : parent
+CATEGORY ||--o{ PRODUCT
+PRODUCT ||--o{ SALE
+SALE ||--o{ COUPON
+PRODUCT ||--o{ INVENTORY
+SALE ||--|| INVENTORY
+INVENTORY ||--o{ INVENTORY_RESERVATION
+CUSTOMER ||--o{ INVENTORY_RESERVATION
+CUSTOMER ||--|| CART
+CART ||--o{ CART_ITEM
+PRODUCT ||--o{ CART_ITEM
+CUSTOMER ||--o{ ORDERS
+INVENTORY_RESERVATION ||--o| ORDERS
+ORDERS ||--|{ ORDER_ITEM
+PRODUCT ||--o{ ORDER_ITEM
+ORDERS ||--o{ PAYMENT
+ORDERS ||--o| SHIPMENT
+CUSTOMER ||--o{ NOTIFICATION
+@enduml

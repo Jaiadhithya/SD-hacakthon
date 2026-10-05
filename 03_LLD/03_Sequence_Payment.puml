@@ -1,0 +1,83 @@
+@startuml Sequence_Payment
+skinparam defaultFontName Arial
+skinparam shadowing false
+skinparam sequenceMessageAlign left
+autonumber
+
+title SALESTORM – Checkout & Payment Sequence\nsuccess · failure · timeout · duplicate payment request
+
+actor Customer as C
+participant "Checkout Facade" as CO
+participant "Inventory Svc" as INV
+participant "Order Svc" as ORD
+participant "Payment Svc" as PAY
+participant "Circuit Breaker\n+ Gateway Adapter" as CB
+participant "Payment Gateway\n(external)" as PG
+database "Payment DB\n(+ outbox)" as PDB
+queue "Kafka" as K
+
+C -> CO : POST /v1/checkout {reservationId R-77}\nIdempotency-Key: chk-9
+CO -> INV : GET reservation R-77 (status RESERVED, not expired?)
+INV --> CO : valid, expiresAt
+CO -> CO : PricingStrategy.price() (sale price, coupon)
+CO -> ORD : createOrder(R-77, items, total) [idem: chk-9]
+ORD --> CO : order O-55 (CREATED → PAYMENT_PENDING)
+CO -> INV : markPaymentPending(R-77)
+CO -> PAY : POST /payments {orderId O-55, amount}\nIdempotency-Key: pay-O-55
+
+== Idempotency ==
+PAY -> PDB : SELECT payment WHERE idempotency_key = 'pay-O-55'
+alt duplicate request (double click / client retry)
+  PDB --> PAY : existing payment P-1 (status X)
+  PAY --> C : 200 same payment P-1 (no second charge)
+else first request
+  PAY -> PDB : INSERT payment P-1 (INITIATED, merchant_txn_ref = 'O-55-P-1')\n UNIQUE(idempotency_key) guards concurrent duplicates
+  PAY -> CB : charge(merchantRef 'O-55-P-1', amount)
+  alt circuit OPEN (gateway unhealthy)
+    CB --> PAY : fail fast
+    PAY --> C : 503 "payment temporarily unavailable, retry"\n(reservation still held until expiresAt)
+  else circuit CLOSED
+    CB -> PG : POST /charges  (Idempotency-Key: O-55-P-1, timeout 10 s)
+
+    alt **SUCCESS** (≈95%)
+      PG --> CB : captured, gw_txn_id G-888
+      CB --> PAY : success
+      PAY -> PDB : BEGIN; UPDATE payment SET status='SUCCEEDED', gateway_txn_id='G-888';\n INSERT outbox(payment.succeeded); COMMIT
+      PAY --> C : 200 {status: SUCCEEDED, orderId O-55}
+      PDB --> K : payment.succeeded {paymentId, orderId, reservationId}
+      note right of K : consumed by Order (→ CONFIRMED)\nand Inventory (→ SOLD)\nsee Order sequence
+
+    else **FAILURE** (≈5%: declined, insufficient funds)
+      PG --> CB : declined
+      CB --> PAY : failure
+      PAY -> PDB : BEGIN; status='FAILED'; INSERT outbox(payment.failed); COMMIT
+      PAY --> C : 402 {status: FAILED, reason}
+      PDB --> K : payment.failed
+      K --> INV : release(R-77, PAYMENT_FAILED)\n→ available +1, reserved -1, Redis INCR
+      K --> ORD : O-55 → CANCELLED
+
+    else **TIMEOUT** (no response in 10 s)
+      CB --> PAY : timeout (outcome UNKNOWN – never assume failure!)
+      PAY -> PDB : status='TIMED_OUT'
+      PAY --> C : 202 {status: PROCESSING} (UI polls / waits for push)
+      loop PaymentReconciler every 15 s (exp. backoff, max 10 min)
+        PAY -> PG : GET /charges?merchantRef=O-55-P-1 (status query)
+        alt gateway says captured
+          PG --> PAY : captured G-888 → same path as SUCCESS
+        else gateway says not found / failed
+          PG --> PAY : failed → same path as FAILURE (release stock)
+        end
+      end
+      PG -> PAY : (also) signed webhook payment.captured / failed\n→ WebhookVerifier → idempotent update
+    end
+  end
+end
+
+note over PAY, PG
+  **No duplicate charge is possible because:**
+  1) our UNIQUE(idempotency_key) allows one PAYMENT row per order attempt;
+  2) the gateway receives the same merchant reference / Idempotency-Key on every retry;
+  3) a retry after a timeout always starts with a status QUERY, never a blind new charge;
+  4) UNIQUE partial index: one SUCCEEDED payment per order (DB-level safety net).
+end note
+@enduml

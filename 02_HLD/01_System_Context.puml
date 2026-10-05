@@ -1,0 +1,31 @@
+@startuml System_Context
+!include <C4/C4_Context>
+!pragma layout smetana
+LAYOUT_WITH_LEGEND()
+
+title SALESTORM – System Context Diagram
+
+Person(customer, "Customer", "Browses the flash sale, reserves, pays, tracks orders")
+Person(admin, "Sale Admin / Ops", "Creates sales, sets stock & price, monitors the event")
+Person_Ext(bot, "Bots / Abusers", "Scripted buyers, scalpers, DDoS")
+
+System(salestorm, "SALESTORM E-Commerce Platform", "Handles discovery, cart, inventory reservation, checkout, payment, orders, fulfilment, notifications and tracking under flash-sale load")
+
+System_Ext(idp, "Identity Provider", "OAuth2 / OIDC login, issues JWTs")
+System_Ext(pg, "Payment Gateway(s)", "Razorpay / Stripe / PayU – card, UPI, wallet; supports idempotency + status query")
+System_Ext(courier, "Delivery Partner(s)", "Shiprocket / Delhivery – pickup, AWB, tracking webhooks")
+System_Ext(notify, "Messaging Providers", "Email (SES), SMS, Push (FCM/APNs)")
+System_Ext(cdn, "CDN + WAF", "Edge caching, bot & DDoS protection")
+
+Rel(customer, cdn, "Uses", "HTTPS")
+Rel(bot, cdn, "Attacks / floods", "HTTPS")
+Rel(cdn, salestorm, "Forwards clean traffic", "HTTPS")
+Rel(admin, salestorm, "Configures sale, monitors", "HTTPS (admin portal)")
+Rel(customer, idp, "Logs in", "OIDC")
+Rel(salestorm, idp, "Validates tokens (JWKS)", "HTTPS")
+Rel(salestorm, pg, "Create / capture / query / refund payments", "HTTPS + Idempotency-Key")
+Rel(pg, salestorm, "Payment status webhooks", "HTTPS (signed)")
+Rel(salestorm, courier, "Create shipment, request pickup", "HTTPS")
+Rel(courier, salestorm, "Delivery status webhooks", "HTTPS (signed)")
+Rel(salestorm, notify, "Send email / SMS / push", "HTTPS")
+@enduml
